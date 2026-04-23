@@ -1,0 +1,52 @@
+FROM registry.fedoraproject.org/fedora:43
+
+# Build dependencies — no Python needed for whisper.cpp
+RUN dnf -y install --setopt=install_weak_deps=False --nodocs \
+    git cmake ninja-build aria2c tar curl \
+    gcc gcc-c++ make \
+    libcurl-devel zlib-devel openssl-devel \
+    libatomic gperftools-libs \
+    ffmpeg-free ffmpeg-free-devel \
+    && dnf clean all && rm -rf /var/cache/dnf/*
+
+# Install TheRock ROCm SDK
+WORKDIR /tmp
+ARG ROCM_MAJOR_VER=7
+ARG GFX=gfx1151
+COPY scripts/install_rocm_sdk.sh /tmp/install_rocm_sdk.sh
+RUN chmod +x /tmp/install_rocm_sdk.sh && \
+    export ROCM_MAJOR_VER=$ROCM_MAJOR_VER && \
+    export GFX=$GFX && \
+    /tmp/install_rocm_sdk.sh
+
+# ROCm environment
+ENV ROCM_PATH=/opt/rocm
+ENV HIP_PATH=/opt/rocm
+ENV HIP_PLATFORM=amd
+ENV PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
+ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH
+
+# Build whisper.cpp with HIP backend targeting gfx1151
+RUN git clone https://github.com/ggerganov/whisper.cpp /opt/whisper.cpp
+WORKDIR /opt/whisper.cpp
+
+RUN export HIP_DEVICE_LIB_PATH=$(find /opt/rocm -type d -name bitcode -print -quit) && \
+    cmake -B build -GNinja \
+        -DGGML_HIP=ON \
+        -DAMDGPU_TARGETS=gfx1151 \
+        -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
+        -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+        -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+        -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build -j$(nproc) --target whisper-server whisper-cli
+
+RUN ln -s /opt/whisper.cpp/build/bin/whisper-server /usr/local/bin/whisper-server && \
+    ln -s /opt/whisper.cpp/build/bin/whisper-cli    /usr/local/bin/whisper-cli
+
+RUN chmod -R a+rX /opt/whisper.cpp/build
+
+WORKDIR /models
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/whisper-server"]
+CMD ["--help"]
