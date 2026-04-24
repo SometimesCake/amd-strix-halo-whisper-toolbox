@@ -38,7 +38,14 @@ RUN python -m pip install \
   "uvicorn[standard]" \
   python-multipart \
   soundfile \
-  numpy
+  numpy \
+  aiofiles
+
+# 5b. WhisperX (faster-whisper backend + word alignment + speaker diarization)
+RUN python -m pip install \
+  whisperx \
+  "pyannote.audio>=3.1" \
+  "librosa>=0.10"
 
 # 6. Cleanup
 WORKDIR /opt

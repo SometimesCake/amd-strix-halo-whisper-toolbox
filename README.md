@@ -197,25 +197,30 @@ The FastAPI transcription server. Installed as `/opt/start-whisper` and symlinke
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model` | `turbo` | Whisper model to load at startup. Model is downloaded from HuggingFace on first run and cached in `~/.cache/whisper/` |
+| `--model` | `large-v3` | WhisperX model to load at startup. Downloaded from HuggingFace on first run |
 | `--host` | `0.0.0.0` | Network interface to bind. `0.0.0.0` means accessible from outside the container |
 | `--port` | `8000` | TCP port for the HTTP server. Change this if 8000 is already in use |
-| `--device` | auto | Force `cuda` (ROCm GPU) or `cpu`. By default, uses `cuda` if `torch.cuda.is_available()` returns true (which it does on a correctly configured ROCm system) |
-| `--language` | auto | Set a default language for all requests (e.g. `en`, `fr`, `de`). When not set, Whisper auto-detects per request |
+| `--device` | auto | Force `cuda` (ROCm GPU) or `cpu`. By default, uses `cuda` if `torch.cuda.is_available()` returns true |
+| `--language` | auto | Set a default language for all requests (e.g. `en`, `fr`, `de`). When not set, WhisperX auto-detects per request |
+| `--jobs-dir` | `/tmp/whisper-jobs` | Directory where async job audio uploads and result JSON files are stored |
+| `--batch-size` | 16 (GPU) / 4 (CPU) | WhisperX transcription batch size |
+
+**Speaker diarization** (who is speaking) is enabled automatically when the `HF_TOKEN` environment variable is set to a valid HuggingFace access token. The token must have access to `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0` — accept the model licences at huggingface.co before use.
 
 **Endpoints:**
 
-- `POST /v1/audio/transcriptions` — transcribe an audio file
+- `POST /v1/audio/transcriptions` — synchronous transcription (OpenAI-compatible, unchanged)
+- `POST /v1/audio/transcriptions/async` — async transcription for large files; returns a job ID immediately
+- `GET /jobs/{job_id}` — poll the status of an async job
+- `GET /jobs/{job_id}/result` — download the completed JSON transcript
 - `GET /health` — returns current model name and device
 
-**How transcription works:**
-1. Audio file is received as a multipart upload
-2. Written to a temporary file (preserving the file extension so ffmpeg can identify the format)
-3. Passed to `whisper.transcribe()` with any options from the request
-4. Temp file is deleted
-5. Result returned as JSON
-
-**To add new response formats**, edit the `if response_format ==` block at the bottom of the `transcribe` function.
+**How async transcription works:**
+1. Audio file is streamed directly to disk in chunks (no full-file RAM buffering)
+2. A job ID is returned immediately — the client can close the connection
+3. WhisperX pipeline runs in a background thread: transcribe → word-align → speaker diarize
+4. When done, the result JSON is written to `{jobs-dir}/{job_id}/result.json`
+5. Client downloads the result via `GET /jobs/{job_id}/result`
 
 **To change the default model**, edit the `--model` default in `parse_args()`.
 
@@ -238,9 +243,11 @@ Helper script for **Fedora Toolbx users**. Pulls the latest image from the regis
 
 ## Design Decisions
 
-### Why `openai-whisper` instead of `faster-whisper`?
+### Why two backends — `openai-whisper` for sync and `whisperx` for async?
 
-`faster-whisper` uses CTranslate2 as its inference backend. CTranslate2's ROCm/HIP support is experimental and incomplete as of mid-2025 — GPU acceleration on gfx1151 is not reliable. `openai-whisper` uses PyTorch directly, so it inherits full ROCm GPU acceleration from the PyTorch nightly build with no additional work. The tradeoff is that `openai-whisper` is somewhat slower than `faster-whisper` on CUDA, but on this hardware the ROCm GPU acceleration more than compensates.
+**Sync endpoint** uses `openai-whisper` (PyTorch-based). PyTorch inherits full ROCm GPU acceleration from the TheRock nightly builds, so this path is guaranteed to run on the gfx1151 GPU. It returns a standard `{"text": "..."}` response compatible with the OpenAI API.
+
+**Async endpoint** uses `whisperx` (CTranslate2 / faster-whisper backend). WhisperX adds a word alignment pass (wav2vec2) and speaker diarization (pyannote) on top of transcription, producing the rich JSON format with word-level timestamps and per-word speaker labels. CTranslate2's ROCm support is experimental — GPU acceleration may work via ROCm's CUDA compatibility layer, but is not guaranteed. For 30–40 hour background jobs this tradeoff is acceptable: even on CPU the job completes eventually, and speaker diarization is the primary reason to use this path.
 
 ### Why PyTorch nightly instead of a stable release?
 
@@ -337,18 +344,20 @@ Mounting `~/.cache/whisper` avoids re-downloading models on every `podman run`.
 #### All start-whisper flags
 
 ```bash
-start-whisper --model large-v3 --port 9000 --language en
-start-whisper --model turbo    --port 8000
+HF_TOKEN=hf_xxx start-whisper --model large-v3 --port 8000 --language en
+start-whisper --model large-v3 --jobs-dir /mnt/data/whisper-jobs
 start-whisper --model small    --device cpu   # force CPU
 ```
 
 | Flag | Default | Options |
 |---|---|---|
-| `--model` | `turbo` | `tiny` `base` `small` `medium` `large-v2` `large-v3` `turbo` |
+| `--model` | `large-v3` | `tiny` `base` `small` `medium` `large-v2` `large-v3` `turbo` |
 | `--port` | `8000` | any free TCP port |
 | `--host` | `0.0.0.0` | `0.0.0.0` (all interfaces) or `127.0.0.1` (localhost only) |
 | `--device` | auto | `cuda` (ROCm GPU) or `cpu` |
 | `--language` | auto-detect | ISO 639-1 code, e.g. `en` `fr` `de` `ja` |
+| `--jobs-dir` | `/tmp/whisper-jobs` | path to store uploaded audio and result JSON files |
+| `--batch-size` | 16 GPU / 4 CPU | WhisperX batch size; reduce if you hit GPU OOM |
 
 ### whisper.cpp Image
 
@@ -394,38 +403,135 @@ podman run -it --rm \
 
 ## API Reference
 
-### `POST /v1/audio/transcriptions`
+### `POST /v1/audio/transcriptions` — synchronous (OpenAI-compatible)
 
-OpenAI-compatible. Accepts multipart form data.
+Blocks until transcription is complete. Suitable for short files. Drop-in replacement for the OpenAI Whisper API.
 
 ```bash
-# Basic
+# Basic — returns {"text": "..."}
 curl -X POST http://localhost:8000/v1/audio/transcriptions \
   -F "file=@recording.mp3"
 
-# With options
+# Plain text response
 curl -X POST http://localhost:8000/v1/audio/transcriptions \
   -F "file=@recording.mp3" \
   -F "language=en" \
-  -F "response_format=text" \
-  -F "temperature=0.0"
+  -F "response_format=text"
 ```
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `file` | file | required | Audio file. Accepts mp3, wav, m4a, flac, ogg, webm, and any format ffmpeg can decode |
-| `model` | string | server default | Whisper model name (informational; server uses its loaded model) |
+| `model` | string | server default | Model name (informational; server uses its loaded model) |
 | `language` | string | auto | ISO 639-1 language code. Auto-detect if omitted |
-| `response_format` | string | `json` | `json` → `{"text": "..."}` · `text` → plain string · `verbose_json` → full Whisper output with segments and timestamps |
-| `temperature` | float | `0.0` | Sampling temperature. `0.0` is greedy (most deterministic) |
-| `prompt` | string | — | Optional text prompt to guide transcription style or vocabulary |
+| `response_format` | string | `json` | `json` → `{"text": "..."}` · `text` → plain string · `verbose_json` → full WhisperX output with word timestamps and speaker labels |
+| `temperature` | float | `0.0` | Sampling temperature |
+| `prompt` | string | — | Optional text prompt to guide transcription |
 
-**Response (`json` format):**
-```json
-{"text": "Hello, this is the transcribed text."}
+**Response (`json`):** `{"text": "Hello, this is the transcribed text."}`
+
+---
+
+### `POST /v1/audio/transcriptions/async` — async job queue (for large files)
+
+Streams the upload to disk and returns a job ID immediately. Use this for files where the transcription time would exceed a reasonable HTTP timeout (typically anything over a few minutes).
+
+```bash
+# 1. Upload and get job ID
+JOB=$(curl -s -X POST http://localhost:8000/v1/audio/transcriptions/async \
+  -F "file=@audiobook.mp3" \
+  -F "language=en" \
+  | jq -r .job_id)
+
+echo "Job ID: $JOB"
 ```
 
-**Response (`verbose_json` format)** includes `segments` with start/end timestamps, per-token log probabilities, and language detection confidence.
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | file | required | Audio file (any format ffmpeg can decode) |
+| `model` | string | server default | Model name (informational) |
+| `language` | string | auto | ISO 639-1 language code |
+| `speaker_name` | string | — | Human-readable label for the primary speaker (stored in job metadata) |
+
+**Response `202`:** `{"job_id": "550e8400-e29b-41d4-a716-446655440000"}`
+
+---
+
+### `GET /jobs/{job_id}` — poll job status
+
+```bash
+curl http://localhost:8000/jobs/$JOB
+```
+
+```json
+{
+  "job_id": "550e8400-...",
+  "status": "processing",
+  "filename": "audiobook.mp3",
+  "created_at": "2026-04-24T10:00:00+00:00",
+  "started_at": "2026-04-24T10:00:05+00:00",
+  "finished_at": null,
+  "error": null
+}
+```
+
+`status` values: `queued` → `processing` → `done` or `failed`
+
+---
+
+### `GET /jobs/{job_id}/result` — download completed transcript
+
+```bash
+# Download when done
+curl -O http://localhost:8000/jobs/$JOB/result
+# Saves as <original-filename>.json
+```
+
+| Condition | Status | Body |
+|---|---|---|
+| Job ID not found | `404` | `{"error": "job not found"}` |
+| Job still running | `202` | `{"status": "processing"}` |
+| Job failed | `422` | `{"error": "...error message..."}` |
+| Job done | `200` | JSON file attachment |
+
+The downloaded JSON matches the WhisperX output format — `segments` array with word-level timestamps and speaker labels:
+
+```json
+{
+  "segments": [
+    {
+      "start": 0.031, "end": 1.733, "text": " This is Audible.",
+      "words": [
+        {"word": "This", "start": 0.031, "end": 0.892, "score": 0.93, "speaker": "SPEAKER_00"}
+      ],
+      "speaker": "SPEAKER_00"
+    }
+  ]
+}
+```
+
+Speaker labels require `HF_TOKEN` to be set at server startup. Without it, all `speaker` fields are `"UNKNOWN"`.
+
+#### Full upload → poll → download workflow
+
+```bash
+# Upload
+JOB=$(curl -s -X POST http://localhost:8000/v1/audio/transcriptions/async \
+  -F "file=@audiobook.mp3" | jq -r .job_id)
+
+# Poll until done
+while true; do
+  STATUS=$(curl -s http://localhost:8000/jobs/$JOB | jq -r .status)
+  echo "Status: $STATUS"
+  [ "$STATUS" = "done" ] || [ "$STATUS" = "failed" ] && break
+  sleep 30
+done
+
+# Download result
+curl -O http://localhost:8000/jobs/$JOB/result
+```
+
+---
 
 ### `GET /health`
 
@@ -434,7 +540,7 @@ curl http://localhost:8000/health
 ```
 
 ```json
-{"status": "ok", "model": "turbo", "device": "cuda"}
+{"status": "ok", "model": "large-v3", "device": "cuda"}
 ```
 
 ---
