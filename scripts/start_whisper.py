@@ -2,8 +2,17 @@
 """
 OpenAI-compatible Whisper transcription server with async job queue.
 
+Both endpoints use openai-whisper (PyTorch) for transcription — full ROCm GPU support.
+ctranslate2 (the whisperx transcription backend) is not used because it has no ROCm
+support and crashes on CPU on this system.
+
+When HF_TOKEN is set the diarization server runs a three-step pipeline:
+  1. openai-whisper  — transcription          (PyTorch / ROCm GPU)
+  2. whisperx align  — word-level timestamps  (PyTorch / ROCm GPU)
+  3. pyannote        — speaker diarization    (PyTorch / ROCm GPU)
+
 Endpoints:
-  POST /v1/audio/transcriptions         — synchronous, OpenAI-compatible (unchanged)
+  POST /v1/audio/transcriptions         — synchronous, OpenAI-compatible
   POST /v1/audio/transcriptions/async   — async job queue, returns job ID immediately
   GET  /jobs/{job_id}                   — poll job status
   GET  /jobs/{job_id}/result            — download completed JSON transcript
@@ -16,15 +25,25 @@ import json
 import os
 import tempfile
 import uuid
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Suppress ROCm runtime noise — must be set before torch is imported
+# since the ROCm runtime initialises at import time.
+os.environ.setdefault("MIOPEN_LOG_LEVEL", "0")  # silences all MIOpen output including DB warnings
+os.environ.setdefault("HSA_XNACK", "0")         # xnack unsupported warning
+
+# Suppress Python-level warnings from pyannote (torchcodec, TF32, std() dof)
+warnings.filterwarnings("ignore", category=UserWarning, module=r"pyannote\..*")
+
 import aiofiles
 import torch
 import whisper
 import whisperx
+import whisperx.diarize
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 import uvicorn
@@ -32,40 +51,32 @@ import uvicorn
 
 def parse_args():
     p = argparse.ArgumentParser(description="Whisper transcription server (OpenAI-compatible)")
-    p.add_argument("--model",      default="large-v3",
+    p.add_argument("--model",    default="large-v3",
                    help="Whisper model (tiny/base/small/medium/large-v2/large-v3/turbo)")
-    p.add_argument("--host",       default="0.0.0.0",   help="Bind host")
-    p.add_argument("--port",       type=int, default=8000, help="Bind port")
-    p.add_argument("--device",     default=None,        help="Device (cuda/cpu). Auto-detects ROCm.")
-    p.add_argument("--language",   default=None,        help="Default language (e.g. 'en'). None = auto-detect.")
-    p.add_argument("--jobs-dir",   default="/tmp/whisper-jobs",
+    p.add_argument("--host",     default="0.0.0.0",  help="Bind host")
+    p.add_argument("--port",     type=int, default=8000, help="Bind port")
+    p.add_argument("--device",   default=None,        help="Device (cuda/cpu). Auto-detects ROCm.")
+    p.add_argument("--language", default=None,        help="Default language (e.g. 'en'). None = auto-detect.")
+    p.add_argument("--jobs-dir", default="/tmp/whisper-jobs",
                    help="Directory for async job output files")
-    p.add_argument("--batch-size", type=int, default=None,
-                   help="WhisperX batch size for async jobs (default: 16 on GPU, 4 on CPU)")
     return p.parse_args()
 
 
-args = parse_args()
+args      = parse_args()
+device    = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+jobs_dir  = Path(args.jobs_dir)
+hf_token  = os.environ.get("HF_TOKEN")
 
-device       = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-compute_type = "float16" if device != "cpu" else "float32"
-batch_size   = args.batch_size or (16 if device != "cpu" else 4)
-jobs_dir     = Path(args.jobs_dir)
-hf_token     = os.environ.get("HF_TOKEN")
-
-# Sync endpoint: openai-whisper via PyTorch — full ROCm GPU support on gfx1151
+# Always load openai-whisper — used by both transcription and diarization servers.
+# The diarization pipeline then passes the openai-whisper segments into whisperx
+# alignment and pyannote diarization, both of which use PyTorch and have full GPU support.
 print(f"Loading openai-whisper model '{args.model}' on device '{device}' ...", flush=True)
 ow_model = whisper.load_model(args.model, device=device)
-print("openai-whisper ready.", flush=True)
 
-# Async endpoint: whisperx (ctranslate2) — word timestamps + speaker diarization
-# Note: ctranslate2 ROCm support is experimental; falls back to CPU if GPU init fails
-print(f"Loading whisperx model '{args.model}' ({compute_type}) ...", flush=True)
-wx_model = whisperx.load_model(args.model, device=device, compute_type=compute_type)
-print("whisperx ready.", flush=True)
-
-if not hf_token:
-    print("Note: HF_TOKEN not set — speaker diarization disabled.", flush=True)
+if hf_token:
+    print("openai-whisper ready. HF_TOKEN set — diarization pipeline enabled.", flush=True)
+else:
+    print("openai-whisper ready. No HF_TOKEN — transcription only.", flush=True)
 
 
 # ── Global state (initialized in lifespan) ────────────────────────────────────
@@ -76,14 +87,23 @@ _transcription_sem: asyncio.Semaphore
 _thread_pool: ThreadPoolExecutor
 
 
-# ── WhisperX pipeline (runs in thread, shares model with main process) ─────────
+# ── Full diarization pipeline: openai-whisper → align → diarize ───────────────
 
 def _transcribe(audio_path: str, language: str | None) -> dict:
-    """Transcribe → word-align → speaker diarize. Returns whisperx result dict."""
-    audio  = whisperx.load_audio(audio_path)
-    result = wx_model.transcribe(audio, batch_size=batch_size, language=language)
-    lang   = result.get("language", "en")
+    """
+    Three-step pipeline — all PyTorch, full ROCm GPU support:
+      1. openai-whisper transcription
+      2. whisperx word alignment (wav2vec2)
+      3. pyannote speaker diarization
+    """
+    audio = whisperx.load_audio(audio_path)
 
+    # Step 1 — transcribe with openai-whisper (GPU)
+    ow_result = whisper.transcribe(ow_model, audio_path, language=language, fp16=(device != "cpu"))
+    lang      = ow_result.get("language", language or "en")
+    result    = {"segments": ow_result["segments"], "language": lang}
+
+    # Step 2 — word-level alignment (GPU)
     try:
         model_a, meta = whisperx.load_align_model(language_code=lang, device=device)
         result = whisperx.align(
@@ -94,21 +114,30 @@ def _transcribe(audio_path: str, language: str | None) -> dict:
     except Exception as exc:
         print(f"  Warning: word alignment failed ({exc}). Continuing.", flush=True)
 
-    if hf_token:
-        try:
-            diarize      = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=device)
-            diarize_segs = diarize(audio)
-            result       = whisperx.assign_word_speakers(diarize_segs, result)
-            del diarize
-        except Exception as exc:
-            print(f"  Warning: diarization failed ({exc}). Continuing.", flush=True)
+    # Step 3 — speaker diarization (GPU)
+    try:
+        diarize      = whisperx.diarize.DiarizationPipeline(token=hf_token, device=device)
+        diarize_segs = diarize(audio)
+        result       = whisperx.diarize.assign_word_speakers(diarize_segs, result)
+        del diarize
+    except Exception as exc:
+        print(f"  Warning: diarization failed ({exc}). Continuing.", flush=True)
 
     for seg in result.get("segments", []):
         seg.setdefault("speaker", "UNKNOWN")
-        for w in seg.get("words", []):
-            w.setdefault("speaker", seg["speaker"])
+        seg.pop("words", None)  # word-level data not needed in final output
 
     return result
+
+
+# ── Fast transcription-only path (no diarization) ─────────────────────────────
+
+def _transcribe_sync(audio_path: str, language: str | None, temperature: float,
+                     prompt: str | None) -> dict:
+    kwargs = dict(language=language, temperature=temperature, fp16=(device != "cpu"))
+    if prompt:
+        kwargs["initial_prompt"] = prompt
+    return whisper.transcribe(ow_model, audio_path, **kwargs)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -116,7 +145,7 @@ def _transcribe(audio_path: str, language: str | None) -> dict:
 async def _stream_to_disk(upload: UploadFile, dest: Path) -> None:
     """Write an upload to disk in chunks — never reads the whole file into RAM."""
     async with aiofiles.open(dest, "wb") as f:
-        async for chunk in upload.stream():
+        while chunk := await upload.read(65536):
             await f.write(chunk)
 
 
@@ -130,9 +159,9 @@ def _now_iso() -> str:
 async def lifespan(_app: FastAPI):
     global _jobs_lock, _transcription_sem, _thread_pool
     jobs_dir.mkdir(parents=True, exist_ok=True)
-    _jobs_lock        = asyncio.Lock()
+    _jobs_lock         = asyncio.Lock()
     _transcription_sem = asyncio.Semaphore(1)   # one transcription at a time (GPU memory)
-    _thread_pool      = ThreadPoolExecutor(max_workers=1)
+    _thread_pool       = ThreadPoolExecutor(max_workers=1)
     yield
     _thread_pool.shutdown(wait=False)
 
@@ -140,17 +169,9 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Whisper Transcription API", lifespan=lifespan)
 
 
-# ── Sync transcription (openai-whisper, PyTorch — full ROCm GPU) ──────────────
-
-def _transcribe_sync(audio_path: str, language: str | None, temperature: float,
-                     prompt: str | None) -> dict:
-    kwargs = dict(language=language, temperature=temperature, fp16=(device != "cpu"))
-    if prompt:
-        kwargs["initial_prompt"] = prompt
-    return whisper.transcribe(ow_model, audio_path, **kwargs)
-
-
-# ── Sync endpoint — OpenAI-compatible, unchanged contract ─────────────────────
+# ── Sync endpoint ─────────────────────────────────────────────────────────────
+# Diarization server (HF_TOKEN set): full three-step pipeline, returns speaker labels.
+# Transcription server (no HF_TOKEN):  fast openai-whisper only, returns text.
 
 @app.post("/v1/audio/transcriptions")
 async def transcribe_sync(
@@ -169,21 +190,29 @@ async def transcribe_sync(
         await _stream_to_disk(file, tmp_path)
         loop = asyncio.get_running_loop()
         async with _transcription_sem:
-            result = await loop.run_in_executor(
-                _thread_pool, _transcribe_sync,
-                str(tmp_path), language or args.language, temperature, prompt,
-            )
+            if hf_token:
+                result = await loop.run_in_executor(
+                    _thread_pool, _transcribe,
+                    str(tmp_path), language or args.language,
+                )
+                text = " ".join(seg.get("text", "").strip() for seg in result.get("segments", []))
+            else:
+                result = await loop.run_in_executor(
+                    _thread_pool, _transcribe_sync,
+                    str(tmp_path), language or args.language, temperature, prompt,
+                )
+                text = result["text"]
     finally:
         tmp_path.unlink(missing_ok=True)
 
     if response_format == "text":
-        return result["text"]
+        return text
     if response_format == "verbose_json":
         return JSONResponse(result)
-    return JSONResponse({"text": result["text"]})
+    return JSONResponse({"text": text})
 
 
-# ── Async endpoint — job queue for large files ─────────────────────────────────
+# ── Async endpoint — job queue for large files ────────────────────────────────
 
 @app.post("/v1/audio/transcriptions/async", status_code=202)
 async def transcribe_async(
@@ -224,9 +253,14 @@ async def _run_job(job_id: str, audio_path: Path, language: str | None) -> None:
     loop = asyncio.get_running_loop()
     try:
         async with _transcription_sem:
-            result = await loop.run_in_executor(
-                _thread_pool, _transcribe, str(audio_path), language,
-            )
+            if hf_token:
+                result = await loop.run_in_executor(
+                    _thread_pool, _transcribe, str(audio_path), language,
+                )
+            else:
+                result = await loop.run_in_executor(
+                    _thread_pool, _transcribe_sync, str(audio_path), language, 0.0, None,
+                )
         async with aiofiles.open(result_path, "w", encoding="utf-8") as f:
             await f.write(json.dumps(result, ensure_ascii=False))
         async with _jobs_lock:

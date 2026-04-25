@@ -12,6 +12,7 @@ A **Fedora 43** Docker/Podman container (Toolbx-compatible) for GPU-accelerated 
 - [How to Build](#how-to-build)
 - [How to Use](#how-to-use)
   - [Python Image — Toolbx (Recommended)](#python-image--toolbx-recommended)
+  - [Python Image — Detached (Background Server)](#python-image--detached-background-server)
   - [Python Image — Docker/Podman](#python-image--dockerpodman)
   - [whisper.cpp Image](#whispercpp-image)
 - [API Reference](#api-reference)
@@ -39,10 +40,13 @@ This section describes every file and what to edit if you need to change somethi
 
 ```
 amd-strix-halo-wisper/
-├── Dockerfile                   # Python image build instructions
-├── Dockerfile.whispercpp        # whisper.cpp image build instructions
-├── README.md                    # This file
-├── refresh_toolbox.sh           # Helper: pull latest image, recreate Toolbx
+├── Dockerfile                             # Python image build instructions
+├── Dockerfile.whispercpp                  # whisper.cpp image build instructions
+├── README.md                              # This file
+├── refresh_toolbox.sh                     # Helper: build image locally, recreate Toolbx
+├── start-server.sh                        # Run server as a detached background container (--mode diarization|transcription)
+├── start_speaker_diarization_server.sh    # Server launch command with HF_TOKEN and model flags (chmod 700)
+├── start_transcription_server.sh          # Server launch command, transcription only, no credentials
 └── scripts/
     ├── install_deps.sh          # System packages installed via dnf (both images)
     ├── install_rocm_sdk.sh      # Downloads and installs TheRock ROCm from S3
@@ -209,7 +213,7 @@ The FastAPI transcription server. Installed as `/opt/start-whisper` and symlinke
 
 **Endpoints:**
 
-- `POST /v1/audio/transcriptions` — synchronous transcription (OpenAI-compatible, unchanged)
+- `POST /v1/audio/transcriptions` — synchronous transcription with full diarization pipeline; blocks until complete
 - `POST /v1/audio/transcriptions/async` — async transcription for large files; returns a job ID immediately
 - `GET /jobs/{job_id}` — poll the status of an async job
 - `GET /jobs/{job_id}/result` — download the completed JSON transcript
@@ -237,17 +241,22 @@ Helper script for **Fedora Toolbx users**. Pulls the latest image from the regis
 | Variable | Value | Description |
 |---|---|---|
 | `TOOLBOX_NAME` | `whisper` | Name of the Toolbx container |
-| `IMAGE` | `docker.io/kyuz0/whisper-therock-gfx1151:latest` | Image to pull and use |
+| `IMAGE` | `localhost/whisper-therock-gfx1151:latest` | Locally built image tag |
 
 ---
 
 ## Design Decisions
 
-### Why two backends — `openai-whisper` for sync and `whisperx` for async?
+### Why does the sync endpoint use different backends depending on HF_TOKEN?
 
-**Sync endpoint** uses `openai-whisper` (PyTorch-based). PyTorch inherits full ROCm GPU acceleration from the TheRock nightly builds, so this path is guaranteed to run on the gfx1151 GPU. It returns a standard `{"text": "..."}` response compatible with the OpenAI API.
+The sync endpoint routes to different backends based on whether `HF_TOKEN` is set at startup:
 
-**Async endpoint** uses `whisperx` (CTranslate2 / faster-whisper backend). WhisperX adds a word alignment pass (wav2vec2) and speaker diarization (pyannote) on top of transcription, producing the rich JSON format with word-level timestamps and per-word speaker labels. CTranslate2's ROCm support is experimental — GPU acceleration may work via ROCm's CUDA compatibility layer, but is not guaranteed. For 30–40 hour background jobs this tradeoff is acceptable: even on CPU the job completes eventually, and speaker diarization is the primary reason to use this path.
+- **No HF_TOKEN** (transcription server): uses `openai-whisper` (PyTorch). Fast, returns text only, no word timestamps or speaker labels. Full ROCm GPU support via TheRock PyTorch builds.
+- **HF_TOKEN set** (diarization server): uses the full WhisperX + pyannote pipeline. Returns word-level timestamps and speaker labels. Blocks until the complete pipeline finishes — if the client times out, that is the caller's responsibility.
+
+The async endpoint follows the same logic — `openai-whisper` when HF_TOKEN is not set, full WhisperX + pyannote when it is. The async queue exists purely to handle large files without HTTP timeouts, not to change the backend. A 30-hour file on the transcription server will use `openai-whisper` end to end.
+
+CTranslate2's ROCm support is experimental — GPU acceleration may work via ROCm's CUDA compatibility layer, but is not guaranteed. On CPU the pipeline is slower but still functional.
 
 ### Why PyTorch nightly instead of a stable release?
 
@@ -326,6 +335,47 @@ start-whisper --model turbo
 
 Models are downloaded to `~/.cache/whisper/` on first use.
 
+### Python Image — Detached (Background Server)
+
+Runs the server as a detached Podman container that persists after the terminal is closed. Server startup flags and credentials live in `start_speaker_diarization_server.sh` (chmod 700), which is mounted read-only into the container at run time.
+
+```bash
+# Start both (default) — diarization on :8000, transcription-only on :8001
+./start-server.sh
+
+# Start one mode only
+./start-server.sh --mode diarization
+./start-server.sh --mode transcription
+```
+
+The script:
+1. Removes any existing container(s) for the selected mode(s)
+2. Starts each as a detached container with the correct ROCm device flags and port mapping
+3. Mounts the appropriate startup script into each container and executes it via bash
+
+| Mode | Container name | Host port | Startup script | Credentials required |
+|---|---|---|---|---|
+| `diarization` | `whisper-diarization` | `8000` | `start_speaker_diarization_server.sh` | Yes — HF_TOKEN embedded in script |
+| `transcription` | `whisper-transcription` | `8001` | `start_transcription_server.sh` | No |
+
+**Key commands:**
+
+```bash
+podman logs -f whisper-server        # tail live logs (watch for "Starting server" before sending requests)
+curl http://localhost:8000/health    # verify the server is ready
+podman stop whisper-server           # graceful shutdown
+podman start whisper-server          # restart a stopped container (model stays loaded in image layers)
+```
+
+**Auto-restart on reboot:** not enabled by default. To enable it, add `--restart unless-stopped` to the `podman run` call in `start-server.sh`.
+
+**Async job state** (result files in `/tmp/whisper-jobs`) is lost if the container is stopped. To persist it, add a volume mount to `start-server.sh`:
+```bash
+-v ~/whisper-jobs:/tmp/whisper-jobs \
+```
+
+---
+
 ### Python Image — Docker/Podman
 
 ```bash
@@ -335,7 +385,7 @@ podman run -it --rm \
   --security-opt seccomp=unconfined \
   -v ~/.cache/whisper:/root/.cache/whisper \
   -p 8000:8000 \
-  whisper-gfx1151:latest \
+  localhost/whisper-therock-gfx1151:latest \
   start-whisper --model turbo --port 8000
 ```
 

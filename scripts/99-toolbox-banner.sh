@@ -69,12 +69,18 @@ printf 'Machine: %s\n' "$MACHINE"
 printf 'GPU    : %s\n\n' "$GPU"
 echo
 printf 'Included:\n'
-printf '  - %-20s → %s\n' "start-whisper" "FastAPI OpenAI-compatible transcription server"
-printf '  - %-20s → %s\n' "API endpoint" "POST http://localhost:8000/v1/audio/transcriptions"
+printf '  - %-20s → %s\n' "start-whisper" "FastAPI OpenAI-compatible transcription + diarization server"
+printf '  - %-20s → %s\n' "Sync endpoint" "POST http://localhost:8000/v1/audio/transcriptions"
+printf '  - %-20s → %s\n' "Async endpoint" "POST http://localhost:8000/v1/audio/transcriptions/async"
 echo
-printf 'Quick start:\n'
+printf 'Quick start (inside toolbox):\n'
 printf '  start-whisper --model large-v3\n'
-printf '  start-whisper --model turbo --port 8000\n\n'
+printf '  HF_TOKEN=hf_xxx start-whisper --model large-v3   # enable speaker diarization\n'
+echo
+printf 'Background servers (run from host, outside toolbox):\n'
+printf '  ./start-server.sh                     # both services: diarization :8000, transcription :8001\n'
+printf '  ./start-server.sh --mode diarization  # diarization only  (port 8000, speaker labels)\n'
+printf '  ./start-server.sh --mode transcription # transcription only (port 8001, no HF_TOKEN needed)\n\n'
 
 unset PROMPT_COMMAND
 PS1='\u@\h:\w\$ '

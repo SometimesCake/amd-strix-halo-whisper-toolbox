@@ -1,0 +1,17 @@
+# Startup script containing credentials — never commit
+start_speaker_diarization_server.sh
+
+# Test output files
+diarization.txt
+d-test-1.txt
+*.txt
+
+# Runtime logs
+nohup.out
+
+# Test audio/data files
+testFiles/
+
+# Stray files
+cake@thehut
+hf

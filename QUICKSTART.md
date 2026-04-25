@@ -31,7 +31,33 @@ HF_TOKEN=hf_xxxxxxxxxxxx start-whisper --model large-v3
 start-whisper --model large-v3
 ```
 
-### Option B — Podman
+### Option B — Detached background server (persists after terminal closes)
+
+Runs the server as a detached Podman container. The container keeps running after you close the terminal.
+
+```bash
+# Start both (default) — diarization on :8000, transcription-only on :8001
+./start-server.sh
+
+# Start one mode only
+./start-server.sh --mode diarization
+./start-server.sh --mode transcription
+```
+
+Useful commands once running:
+
+```bash
+podman logs -f whisper-diarization      # tail diarization logs
+podman logs -f whisper-transcription    # tail transcription logs
+curl http://localhost:8000/health       # diarization ready check
+curl http://localhost:8001/health       # transcription ready check
+podman stop whisper-diarization
+podman stop whisper-transcription
+```
+
+The server won't be ready to accept requests until model loading is complete — watch `podman logs` for `Starting server on 0.0.0.0:8000`.
+
+### Option C — Podman (interactive, foreground)
 
 ```bash
 podman run -it --rm \
@@ -41,7 +67,7 @@ podman run -it --rm \
   -e HF_TOKEN=hf_xxxxxxxxxxxx \
   -v ~/.cache/whisper:/root/.cache/whisper \
   -p 8000:8000 \
-  docker.io/kyuz0/whisper-therock-gfx1151:latest \
+  localhost/whisper-therock-gfx1151:latest \
   start-whisper --model large-v3
 ```
 

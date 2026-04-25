@@ -22,14 +22,7 @@ ENV PIP_NO_CACHE_DIR=1
 RUN printf 'source /opt/venv/bin/activate\n' > /etc/profile.d/venv.sh
 RUN python -m pip install --upgrade pip wheel packaging "setuptools<80.0.0"
 
-# 4. Install PyTorch (TheRock Nightly)
-RUN python -m pip install \
-  --index-url https://rocm.nightlies.amd.com/v2-staging/gfx1151/ \
-  --pre torch torchaudio torchvision && \
-  # Fix caching/JSON serialization bug in recent PyTorch nightlies
-  sed -i 's/json.dumps(config_dict, sort_keys=True)/json.dumps(config_dict, sort_keys=True, default=str)/g' /opt/venv/lib64/python3.12/site-packages/torch/_dynamo/utils.py
-
-# 5. Install Whisper + API server dependencies
+# 4. Install Whisper + API server dependencies
 RUN python -m pip install \
   openai-whisper \
   transformers \
@@ -41,11 +34,20 @@ RUN python -m pip install \
   numpy \
   aiofiles
 
-# 5b. WhisperX (faster-whisper backend + word alignment + speaker diarization)
+# 4b. WhisperX (faster-whisper backend + word alignment + speaker diarization)
 RUN python -m pip install \
   whisperx \
   "pyannote.audio>=3.1" \
   "librosa>=0.10"
+
+# 5. Install PyTorch (TheRock Nightly) — installed LAST so pyannote/whisperx deps
+#    cannot overwrite it with a PyPI CUDA build during their dependency resolution.
+RUN python -m pip install \
+  --upgrade \
+  --index-url https://rocm.nightlies.amd.com/v2-staging/gfx1151/ \
+  --pre torch torchaudio torchvision && \
+  # Fix caching/JSON serialization bug in recent PyTorch nightlies
+  sed -i 's/json.dumps(config_dict, sort_keys=True)/json.dumps(config_dict, sort_keys=True, default=str)/g' /opt/venv/lib64/python3.12/site-packages/torch/_dynamo/utils.py || true
 
 # 6. Cleanup
 WORKDIR /opt
